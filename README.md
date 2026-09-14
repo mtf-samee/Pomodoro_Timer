@@ -6,7 +6,7 @@ A feature-rich Pomodoro timer desktop application built with PyQt6, featuring bu
 
 The easiest way to use the application is via the pre-compiled AppImage, which includes all dependencies and default audio assets.
 
-1. Download the latest `PomodoroTimer-x86_64.AppImage` from the Releases page.
+1. Download the latest `PomodoroTimer-x86_64.AppImage` from the [Releases](https://github.com/mtf-samee/Pomodoro_Timer/releases) page.
 2. Make the file executable:
    ```bash
    chmod +x PomodoroTimer-x86_64.AppImage
