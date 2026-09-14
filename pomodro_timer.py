@@ -6,13 +6,14 @@ import time
 import re
 import shutil
 import subprocess
+import fcntl
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QDialog,
                              QListWidget, QListWidgetItem, QLineEdit,
                              QFileDialog, QMessageBox, QCheckBox, QInputDialog,
                              QComboBox, QProgressBar, QSystemTrayIcon, QMenu, QSlider, QStyle)
-from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QUrl, QEvent
-from PyQt6.QtGui import QFont, QIcon, QAction
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QUrl
+from PyQt6.QtGui import QFont, QIcon, QAction, QShortcut, QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 CONFIG_DIR = os.path.expanduser("~/.config/study_timer")
@@ -82,7 +83,7 @@ class ConfigManager:
                         if "volume" not in stage:
                             stage["volume"] = 1.0
 
-        except Exception as e:
+        except Exception:
             if os.path.exists(BACKUP_FILE):
                 try:
                     with open(BACKUP_FILE, 'r') as f:
@@ -123,7 +124,7 @@ class NotificationManager:
     @staticmethod
     def send(title, message):
         try:
-            subprocess.Popen(['notify-send', '-a', 'Study Timer', '-u', 'normal', title, message])
+            subprocess.Popen(['notify-send', '-a', 'Pomodoro Timer', '-u', 'normal', title, message])
         except FileNotFoundError:
             pass
 
@@ -559,19 +560,20 @@ class MainWindow(QMainWindow):
         self.engine.state_changed_signal.connect(self.update_state_display)
         self.engine.completed_signal.connect(self.show_completion)
 
-        self.setWindowTitle("Study Timer")
+        self.setWindowTitle("Pomodoro Timer")
 
-        icon = QIcon.fromTheme("chronometer")
-        if icon.isNull(): icon = QIcon.fromTheme("timer")
-        self.setWindowIcon(icon)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_icon = os.path.join(script_dir, "pomodro_timer.png")
+        if os.path.exists(local_icon):
+            app_icon = QIcon(local_icon)
+            self.setWindowIcon(app_icon)
+            QApplication.instance().setWindowIcon(app_icon)
 
         self.resize(650, 450)
-
         self.setup_ui()
+        self.setup_shortcuts()
         self.setup_tray()
         self.engine.reset()
-
-        QApplication.instance().installEventFilter(self)
 
     def setup_ui(self):
         central = QWidget()
@@ -612,11 +614,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_next)
 
         btn_layout = QHBoxLayout()
+
         self.btn_start = QPushButton("Start (Space)")
+        self.btn_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_start.clicked.connect(self.toggle_timer)
+
         self.btn_reset = QPushButton("Reset Session (R)")
+        self.btn_reset.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_reset.clicked.connect(self.engine.reset)
+
         self.btn_skip = QPushButton("Skip Stage (S)")
+        self.btn_skip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_skip.clicked.connect(self.engine.skip)
 
         btn_layout.addWidget(self.btn_start)
@@ -625,8 +633,23 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_layout)
 
         self.btn_edit = QPushButton("Remake / Edit Timer (E)")
+        self.btn_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_edit.clicked.connect(self.open_editor)
         layout.addWidget(self.btn_edit)
+
+        self.btn_tray = QPushButton("Run in Background / Minimize (M)")
+        self.btn_tray.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_tray.clicked.connect(self.hide)
+        layout.addWidget(self.btn_tray)
+
+    def setup_shortcuts(self):
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_timer)
+        QShortcut(QKeySequence(Qt.Key.Key_R), self, activated=self.engine.reset)
+        QShortcut(QKeySequence(Qt.Key.Key_S), self, activated=self.engine.skip)
+        QShortcut(QKeySequence(Qt.Key.Key_E), self, activated=self.open_editor)
+        QShortcut(QKeySequence(Qt.Key.Key_F), self, activated=self.toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, activated=self.hide)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.exit_fullscreen)
 
     def setup_tray(self):
         QApplication.instance().setQuitOnLastWindowClosed(False)
@@ -647,39 +670,6 @@ class MainWindow(QMainWindow):
         self.tray_icon.activated.connect(self.tray_activated)
         self.tray_icon.show()
 
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.KeyPress:
-            fw = QApplication.focusWidget()
-            if isinstance(fw, (QLineEdit, QSpinBox, QComboBox)):
-                return super().eventFilter(obj, event)
-
-            key = event.key()
-            if key == Qt.Key.Key_Space:
-                if isinstance(fw, QPushButton):
-                    return super().eventFilter(obj, event)
-                self.toggle_timer()
-                return True
-            elif key == Qt.Key.Key_R:
-                self.engine.reset()
-                return True
-            elif key == Qt.Key.Key_S:
-                self.engine.skip()
-                return True
-            elif key == Qt.Key.Key_E:
-                self.open_editor()
-                return True
-            elif key == Qt.Key.Key_F:
-                self.toggle_fullscreen()
-                return True
-            elif key == Qt.Key.Key_M:
-                self.hide()
-                return True
-            elif key == Qt.Key.Key_Escape:
-                if self.isFullScreen():
-                    self.showNormal()
-                    return True
-        return super().eventFilter(obj, event)
-
     def toggle_timer(self):
         if self.engine.state == "RUNNING":
             self.engine.pause()
@@ -691,6 +681,10 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showFullScreen()
+
+    def exit_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
 
     def toggle_window(self):
         if self.isHidden():
@@ -767,8 +761,18 @@ class MainWindow(QMainWindow):
         self.tray_icon.setToolTip("Timer Complete")
 
 if __name__ == "__main__":
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    lock_file = os.path.join(CONFIG_DIR, "pomodoro_timer.lock")
+    lock_fp = open(lock_file, 'w')
+    try:
+        fcntl.lockf(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("Pomodoro Timer is already running.")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
-    app.setApplicationName("Study Timer")
+    app.setApplicationName("Pomodoro Timer")
+    app.setDesktopFileName("pomodro-timer.desktop")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
