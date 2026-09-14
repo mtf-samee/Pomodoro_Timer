@@ -1,4 +1,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
+build/
+dist/
+AppDir/
+*.AppImage
+*.spec
+appimagetool*.AppImage
+*.lock
+*.pid
