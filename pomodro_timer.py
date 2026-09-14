@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import fcntl
+import signal
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QDialog,
                              QListWidget, QListWidgetItem, QLineEdit,
@@ -649,6 +650,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_E), self, activated=self.open_editor)
         QShortcut(QKeySequence(Qt.Key.Key_F), self, activated=self.toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key.Key_M), self, activated=self.hide)
+        QShortcut(QKeySequence(Qt.Key.Key_Q), self, activated=QApplication.instance().quit)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.exit_fullscreen)
 
     def setup_tray(self):
@@ -659,7 +661,7 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         restore_action = QAction("Show / Hide", self)
         restore_action.triggered.connect(self.toggle_window)
-        quit_action = QAction("Quit Application", self)
+        quit_action = QAction("Quit Application (Q)", self)
         quit_action.triggered.connect(QApplication.instance().quit)
 
         tray_menu.addAction(restore_action)
@@ -763,16 +765,37 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     os.makedirs(CONFIG_DIR, exist_ok=True)
     lock_file = os.path.join(CONFIG_DIR, "pomodoro_timer.lock")
+    pid_file = os.path.join(CONFIG_DIR, "pomodoro_timer.pid")
+
     lock_fp = open(lock_file, 'w')
     try:
         fcntl.lockf(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(pid_file, 'w') as f:
+            f.write(str(os.getpid()))
     except IOError:
-        print("Pomodoro Timer is already running.")
+        # App is already running, send SIGUSR1 to toggle window
+        try:
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGUSR1)
+        except Exception:
+            pass
         sys.exit(0)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Pomodoro Timer")
     app.setDesktopFileName("pomodro-timer.desktop")
     window = MainWindow()
+
+    # Handle the incoming toggle signal
+    def handle_toggle(signum, frame):
+        QTimer.singleShot(0, window.toggle_window)
+    signal.signal(signal.SIGUSR1, handle_toggle)
+
+    # Fast dummy timer to ensure python signals are processed instantly by the Qt Event Loop
+    wakeup_timer = QTimer()
+    wakeup_timer.timeout.connect(lambda: None)
+    wakeup_timer.start(100)
+
     window.show()
     sys.exit(app.exec())
