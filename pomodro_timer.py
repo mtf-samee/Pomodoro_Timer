@@ -6,12 +6,13 @@ import time
 import re
 import shutil
 import subprocess
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QPushButton, QDialog, 
-                             QListWidget, QListWidgetItem, QLineEdit, 
-                             QFileDialog, QMessageBox, QCheckBox, QInputDialog, QComboBox)
-from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QUrl
-from PyQt6.QtGui import QShortcut, QKeySequence, QFont
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QPushButton, QDialog,
+                             QListWidget, QListWidgetItem, QLineEdit,
+                             QFileDialog, QMessageBox, QCheckBox, QInputDialog,
+                             QComboBox, QProgressBar, QSystemTrayIcon, QMenu, QSlider, QStyle)
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QUrl, QEvent
+from PyQt6.QtGui import QFont, QIcon, QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 CONFIG_DIR = os.path.expanduser("~/.config/study_timer")
@@ -19,7 +20,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BACKUP_FILE = os.path.join(CONFIG_DIR, "config.json.bak")
 
 def parse_duration(text):
-    text = text.lower().strip()
+    text = str(text).lower().strip()
     if not text:
         return 0
     total_seconds = 0
@@ -53,7 +54,8 @@ class ConfigManager:
                 "Default": {
                     "rounds": 1,
                     "infinite": False,
-                    "stages": [{"name": "WORK", "duration": 1500, "sound": ""}]
+                    "auto_advance": True,
+                    "stages": [{"name": "WORK", "duration": 1500, "sound": "", "volume": 1.0}]
                 }
             },
             "current_preset": "Default"
@@ -61,20 +63,26 @@ class ConfigManager:
         self.load()
 
     def load(self):
-        if not os.path.exists(CONFIG_DIR):
-            os.makedirs(CONFIG_DIR)
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         if not os.path.exists(CONFIG_FILE):
             self.save()
             return
-        
+
         try:
             with open(CONFIG_FILE, 'r') as f:
                 data = json.load(f)
                 self.config.update(data)
                 if self.config["current_preset"] not in self.config["presets"]:
                     self.config["current_preset"] = list(self.config["presets"].keys())[0]
+
+                for preset in self.config["presets"].values():
+                    if "auto_advance" not in preset:
+                        preset["auto_advance"] = True
+                    for stage in preset["stages"]:
+                        if "volume" not in stage:
+                            stage["volume"] = 1.0
+
         except Exception as e:
-            print(f"Error loading config: {e}. Attempting backup recovery.")
             if os.path.exists(BACKUP_FILE):
                 try:
                     with open(BACKUP_FILE, 'r') as f:
@@ -83,8 +91,7 @@ class ConfigManager:
                     pass
 
     def save(self):
-        if not os.path.exists(CONFIG_DIR):
-            os.makedirs(CONFIG_DIR)
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         if os.path.exists(CONFIG_FILE):
             shutil.copy(CONFIG_FILE, BACKUP_FILE)
         with open(CONFIG_FILE, 'w') as f:
@@ -99,15 +106,13 @@ class AudioManager:
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(1.0)
 
-    def play(self, sound_file):
-        if not sound_file:
-            return
-        path = os.path.join(self.config.config["sound_dir"], sound_file)
-        if not os.path.exists(path):
-            print(f"Sound file not found: {path}")
-            return
+    def play(self, sound_file, volume=1.0):
+        if not sound_file: return
+        path = sound_file if os.path.isabs(sound_file) else os.path.join(self.config.config["sound_dir"], sound_file)
+        if not os.path.exists(path): return
+
+        self.audio_output.setVolume(volume)
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
 
@@ -118,13 +123,14 @@ class NotificationManager:
     @staticmethod
     def send(title, message):
         try:
-            subprocess.Popen(['notify-send', '-a', 'Study Timer', title, message])
+            subprocess.Popen(['notify-send', '-a', 'Study Timer', '-u', 'normal', title, message])
         except FileNotFoundError:
             pass
 
 class TimerEngine(QObject):
-    tick_signal = pyqtSignal(int)
+    tick_signal = pyqtSignal(int, int)
     stage_changed_signal = pyqtSignal(int, int)
+    state_changed_signal = pyqtSignal(str)
     completed_signal = pyqtSignal(int)
 
     def __init__(self, config_manager, audio_manager):
@@ -133,17 +139,15 @@ class TimerEngine(QObject):
         self.audio = audio_manager
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
-        
+
         self.state = "STOPPED"
         self.stage_idx = 0
         self.round_idx = 1
         self.remaining = 0
+        self.current_stage_duration = 0
         self.target_time = 0
         self.total_elapsed = 0
-        self.stages = []
-        self.rounds = 1
-        self.infinite = False
-        
+
         self.load_preset()
 
     def load_preset(self):
@@ -151,34 +155,46 @@ class TimerEngine(QObject):
         self.stages = preset["stages"]
         self.rounds = preset["rounds"]
         self.infinite = preset["infinite"]
+        self.auto_advance = preset.get("auto_advance", True)
         self.reset()
+
+    def set_state(self, new_state):
+        self.state = new_state
+        self.state_changed_signal.emit(self.state)
 
     def start(self):
         if not self.stages: return
-        if self.state == "STOPPED":
-            self.remaining = self.stages[self.stage_idx]["duration"]
+
+        if self.state == "STOPPED" or self.state == "WAITING":
+            self.current_stage_duration = self.stages[self.stage_idx]["duration"]
+            if self.state == "STOPPED":
+                self.remaining = self.current_stage_duration
+
         if self.state != "RUNNING":
             self.target_time = time.monotonic() + self.remaining
-            self.state = "RUNNING"
+            self.set_state("RUNNING")
             self.timer.start(100)
 
     def pause(self):
         if self.state == "RUNNING":
             self.remaining = self.target_time - time.monotonic()
-            self.state = "PAUSED"
+            self.set_state("PAUSED")
             self.timer.stop()
 
     def reset(self):
-        self.state = "STOPPED"
+        self.set_state("STOPPED")
         self.timer.stop()
         self.stage_idx = 0
         self.round_idx = 1
         self.total_elapsed = 0
         if self.stages:
-            self.remaining = self.stages[0]["duration"]
+            self.current_stage_duration = self.stages[0]["duration"]
+            self.remaining = self.current_stage_duration
         else:
+            self.current_stage_duration = 0
             self.remaining = 0
-        self.tick_signal.emit(self.remaining)
+
+        self.tick_signal.emit(self.remaining, self.current_stage_duration)
         self.stage_changed_signal.emit(self.stage_idx, self.round_idx)
 
     def skip(self):
@@ -190,42 +206,51 @@ class TimerEngine(QObject):
         if self.state != "RUNNING": return
         now = time.monotonic()
         rem = int(self.target_time - now)
+
         if rem <= 0:
             self.total_elapsed += self.stages[self.stage_idx]["duration"]
             self.next_stage(skipped=False)
         else:
             if rem != int(self.remaining):
                 self.remaining = rem
-                self.tick_signal.emit(rem)
+                self.tick_signal.emit(rem, self.current_stage_duration)
 
     def next_stage(self, skipped=False):
         if not skipped:
             current_stage = self.stages[self.stage_idx]
-            sound = self.config_manager.config["common_sound_file"] if self.config_manager.config["use_common_sound"] else current_stage["sound"]
-            self.audio.play(sound)
+            sound = self.config_manager.config["common_sound_file"] if self.config_manager.config["use_common_sound"] else current_stage.get("sound", "")
+            vol = current_stage.get("volume", 1.0)
+            self.audio.play(sound, vol)
             NotificationManager.send("Stage Complete", current_stage["name"])
 
         self.stage_idx += 1
-        
+
         if self.stage_idx >= len(self.stages):
             self.stage_idx = 0
             self.round_idx += 1
             if not self.infinite and self.round_idx > self.rounds:
-                self.state = "STOPPED"
+                self.set_state("STOPPED")
                 self.timer.stop()
                 NotificationManager.send("Timer Complete", "All rounds finished.")
                 self.completed_signal.emit(self.total_elapsed)
                 return
 
-        self.remaining = self.stages[self.stage_idx]["duration"]
-        self.target_time = time.monotonic() + self.remaining
-        if not skipped:
-            NotificationManager.send("Stage Started", self.stages[self.stage_idx]["name"])
-            
-        if self.state == "PAUSED":
-            self.tick_signal.emit(self.remaining)
-            
+        self.current_stage_duration = self.stages[self.stage_idx]["duration"]
+        self.remaining = self.current_stage_duration
         self.stage_changed_signal.emit(self.stage_idx, self.round_idx)
+        self.tick_signal.emit(self.remaining, self.current_stage_duration)
+
+        if not self.auto_advance and not skipped:
+            self.set_state("WAITING")
+            self.timer.stop()
+        else:
+            self.target_time = time.monotonic() + self.remaining
+            if self.state == "PAUSED":
+                pass
+            else:
+                self.set_state("RUNNING")
+                if not skipped:
+                    NotificationManager.send("Stage Started", self.stages[self.stage_idx]["name"])
 
 class EditorDialog(QDialog):
     def __init__(self, config_manager, audio_manager, parent=None):
@@ -233,14 +258,15 @@ class EditorDialog(QDialog):
         self.config = config_manager
         self.audio = audio_manager
         self.setWindowTitle("Edit Timer Configuration")
-        self.setMinimumSize(500, 500)
+        self.setMinimumSize(600, 600)
         self.stages = [s.copy() for s in self.config.get_current_preset()["stages"]]
+        self.audio.player.playbackStateChanged.connect(self.on_playback_state_changed)
         self.setup_ui()
         self.refresh_list()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        
+
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
         self.preset_combo = QComboBox()
@@ -248,15 +274,15 @@ class EditorDialog(QDialog):
         self.preset_combo.setCurrentText(self.config.config["current_preset"])
         self.preset_combo.currentTextChanged.connect(self.change_preset)
         preset_layout.addWidget(self.preset_combo)
-        
+
         btn_new_preset = QPushButton("New")
         btn_new_preset.clicked.connect(self.new_preset)
         preset_layout.addWidget(btn_new_preset)
-        
+
         btn_del_preset = QPushButton("Delete")
         btn_del_preset.clicked.connect(self.delete_preset)
         preset_layout.addWidget(btn_del_preset)
-        
+
         layout.addLayout(preset_layout)
 
         hbox = QHBoxLayout()
@@ -288,56 +314,75 @@ class EditorDialog(QDialog):
         self.edit_name = QLineEdit()
         self.edit_duration = QLineEdit()
         self.edit_duration.setPlaceholderText("e.g. 40m, 90s, 1h 30m")
+
+        vol_layout = QHBoxLayout()
+        vol_layout.addWidget(QLabel("Stage Volume:"))
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        vol_layout.addWidget(self.vol_slider)
+
+        snd_layout = QHBoxLayout()
         self.edit_sound = QLineEdit()
-        
+        self.edit_sound.setPlaceholderText("Sound File / Path")
+        btn_browse_stage = QPushButton("Browse")
+        btn_browse_stage.clicked.connect(self.browse_stage_sound)
+
+        self.btn_test_sound = QPushButton("Test")
+        self.btn_test_sound.clicked.connect(self.toggle_test_sound)
+
+        snd_layout.addWidget(self.edit_sound)
+        snd_layout.addWidget(btn_browse_stage)
+        snd_layout.addWidget(self.btn_test_sound)
+
         btn_apply = QPushButton("Apply to Stage")
         btn_apply.clicked.connect(self.apply_stage_edit)
-        
-        btn_test_sound = QPushButton("Test Sound")
-        btn_test_sound.clicked.connect(lambda: self.audio.play(self.edit_sound.text()))
 
         s_layout = QVBoxLayout()
         s_layout.addWidget(QLabel("Stage Name:"))
         s_layout.addWidget(self.edit_name)
         s_layout.addWidget(QLabel("Duration:"))
         s_layout.addWidget(self.edit_duration)
-        s_layout.addWidget(QLabel("Sound File (in sound dir):"))
-        
-        snd_hbox = QHBoxLayout()
-        snd_hbox.addWidget(self.edit_sound)
-        snd_hbox.addWidget(btn_test_sound)
-        s_layout.addLayout(snd_hbox)
+        s_layout.addLayout(vol_layout)
+        s_layout.addWidget(QLabel("Sound File (Overrides common if set):"))
+        s_layout.addLayout(snd_layout)
         s_layout.addWidget(btn_apply)
         layout.addLayout(s_layout)
 
-        layout.addWidget(QLabel("--- Global Settings ---"))
+        layout.addWidget(QLabel("--- Global Preset Settings ---"))
         g_layout = QHBoxLayout()
         self.edit_rounds = QLineEdit(str(self.config.get_current_preset()["rounds"]))
         self.chk_infinite = QCheckBox("Infinite Rounds")
         self.chk_infinite.setChecked(self.config.get_current_preset()["infinite"])
+
+        self.chk_auto = QCheckBox("Auto-start next stage")
+        self.chk_auto.setChecked(self.config.get_current_preset().get("auto_advance", True))
+
         g_layout.addWidget(QLabel("Rounds:"))
         g_layout.addWidget(self.edit_rounds)
         g_layout.addWidget(self.chk_infinite)
+        g_layout.addWidget(self.chk_auto)
         layout.addLayout(g_layout)
 
         dir_layout = QHBoxLayout()
         self.edit_sound_dir = QLineEdit(self.config.config["sound_dir"])
-        btn_browse = QPushButton("Browse")
-        btn_browse.clicked.connect(self.browse_dir)
-        dir_layout.addWidget(QLabel("Sound Dir:"))
+        btn_browse_dir = QPushButton("Browse Dir")
+        btn_browse_dir.clicked.connect(self.browse_dir)
+        dir_layout.addWidget(QLabel("Base Sound Dir:"))
         dir_layout.addWidget(self.edit_sound_dir)
-        dir_layout.addWidget(btn_browse)
+        dir_layout.addWidget(btn_browse_dir)
         layout.addLayout(dir_layout)
 
         com_layout = QHBoxLayout()
         self.chk_common = QCheckBox("Use Common Sound")
         self.chk_common.setChecked(self.config.config["use_common_sound"])
         self.edit_common = QLineEdit(self.config.config["common_sound_file"])
-        btn_test_common = QPushButton("Test Common")
-        btn_test_common.clicked.connect(lambda: self.audio.play(self.edit_common.text()))
+        btn_browse_com = QPushButton("Browse File")
+        btn_browse_com.clicked.connect(self.browse_common)
+
         com_layout.addWidget(self.chk_common)
         com_layout.addWidget(self.edit_common)
-        com_layout.addWidget(btn_test_common)
+        com_layout.addWidget(btn_browse_com)
         layout.addLayout(com_layout)
 
         btn_layout = QHBoxLayout()
@@ -349,12 +394,44 @@ class EditorDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
         layout.addLayout(btn_layout)
 
+    def browse_stage_sound(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Select Stage Sound", self.config.config["sound_dir"], "Audio Files (*.wav *.mp3 *.ogg *.flac)")
+        if file:
+            self.edit_sound.setText(file)
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Sound Directory", self.config.config["sound_dir"])
+        if d:
+            self.edit_sound_dir.setText(d)
+
+    def browse_common(self):
+        file, _ = QFileDialog.getOpenFileName(self, "Select Common Sound", self.config.config["sound_dir"], "Audio Files (*.wav *.mp3 *.ogg *.flac)")
+        if file:
+            self.edit_common.setText(file)
+
+    def toggle_test_sound(self):
+        if self.audio.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.audio.stop()
+        else:
+            vol = self.vol_slider.value() / 100.0
+            snd = self.edit_sound.text()
+            if not snd and self.chk_common.isChecked():
+                snd = self.edit_common.text()
+            self.audio.play(snd, vol)
+
+    def on_playback_state_changed(self, state):
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.btn_test_sound.setText("Stop")
+        else:
+            self.btn_test_sound.setText("Test")
+
     def change_preset(self, preset_name):
         if not preset_name or preset_name not in self.config.config["presets"]: return
         preset = self.config.config["presets"][preset_name]
         self.stages = [s.copy() for s in preset["stages"]]
         self.edit_rounds.setText(str(preset["rounds"]))
         self.chk_infinite.setChecked(preset["infinite"])
+        self.chk_auto.setChecked(preset.get("auto_advance", True))
         self.refresh_list()
 
     def new_preset(self):
@@ -363,7 +440,8 @@ class EditorDialog(QDialog):
             self.config.config["presets"][text] = {
                 "rounds": 1,
                 "infinite": False,
-                "stages": [{"name": "NEW STAGE", "duration": 300, "sound": ""}]
+                "auto_advance": True,
+                "stages": [{"name": "NEW STAGE", "duration": 300, "sound": "", "volume": 1.0}]
             }
             self.preset_combo.addItem(text)
             self.preset_combo.setCurrentText(text)
@@ -387,7 +465,8 @@ class EditorDialog(QDialog):
         stage = self.stages[idx]
         self.edit_name.setText(stage["name"])
         self.edit_duration.setText(format_duration(stage["duration"]))
-        self.edit_sound.setText(stage["sound"])
+        self.edit_sound.setText(stage.get("sound", ""))
+        self.vol_slider.setValue(int(stage.get("volume", 1.0) * 100))
 
     def apply_stage_edit(self):
         idx = self.list_widget.currentRow()
@@ -399,11 +478,12 @@ class EditorDialog(QDialog):
         self.stages[idx]["name"] = self.edit_name.text()
         self.stages[idx]["duration"] = dur
         self.stages[idx]["sound"] = self.edit_sound.text()
+        self.stages[idx]["volume"] = self.vol_slider.value() / 100.0
         self.refresh_list()
         self.list_widget.setCurrentRow(idx)
 
     def add_stage(self):
-        self.stages.append({"name": "NEW", "duration": 300, "sound": ""})
+        self.stages.append({"name": "NEW", "duration": 300, "sound": "", "volume": 1.0})
         self.refresh_list()
         self.list_widget.setCurrentRow(len(self.stages)-1)
 
@@ -437,10 +517,6 @@ class EditorDialog(QDialog):
             self.refresh_list()
             self.list_widget.setCurrentRow(idx+1)
 
-    def browse_dir(self):
-        dir = QFileDialog.getExistingDirectory(self, "Select Sound Directory")
-        if dir: self.edit_sound_dir.setText(dir)
-
     def save_config(self):
         preset_name = self.preset_combo.currentText()
         try:
@@ -449,19 +525,28 @@ class EditorDialog(QDialog):
         except ValueError:
             QMessageBox.warning(self, "Error", "Rounds must be a positive integer.")
             return
-        
+
         self.config.config["sound_dir"] = self.edit_sound_dir.text()
         self.config.config["use_common_sound"] = self.chk_common.isChecked()
         self.config.config["common_sound_file"] = self.edit_common.text()
         self.config.config["current_preset"] = preset_name
-        
+
         preset = self.config.config["presets"][preset_name]
         preset["rounds"] = r
         preset["infinite"] = self.chk_infinite.isChecked()
+        preset["auto_advance"] = self.chk_auto.isChecked()
         preset["stages"] = self.stages
-        
+
         self.config.save()
         self.accept()
+
+    def closeEvent(self, event):
+        self.audio.stop()
+        try:
+            self.audio.player.playbackStateChanged.disconnect(self.on_playback_state_changed)
+        except TypeError:
+            pass
+        super().closeEvent(event)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -471,15 +556,24 @@ class MainWindow(QMainWindow):
         self.engine = TimerEngine(self.config, self.audio)
         self.engine.tick_signal.connect(self.update_time_display)
         self.engine.stage_changed_signal.connect(self.update_stage_display)
+        self.engine.state_changed_signal.connect(self.update_state_display)
         self.engine.completed_signal.connect(self.show_completion)
 
+        self.setWindowTitle("Study Timer")
+
+        icon = QIcon.fromTheme("chronometer")
+        if icon.isNull(): icon = QIcon.fromTheme("timer")
+        self.setWindowIcon(icon)
+
+        self.resize(650, 450)
+
         self.setup_ui()
-        self.setup_shortcuts()
+        self.setup_tray()
         self.engine.reset()
 
+        QApplication.instance().installEventFilter(self)
+
     def setup_ui(self):
-        self.setWindowTitle("Study Timer")
-        self.resize(600, 400)
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -490,13 +584,17 @@ class MainWindow(QMainWindow):
         font.setPointSize(36)
         font.setBold(True)
         self.lbl_stage.setFont(font)
-        
+
         self.lbl_time = QLabel("00:00")
         self.lbl_time.setAlignment(Qt.AlignmentFlag.AlignCenter)
         font_time = QFont("Monospace")
         font_time.setPointSize(72)
         font_time.setBold(True)
         self.lbl_time.setFont(font_time)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(10)
 
         self.lbl_round = QLabel("Round: 1 / 1")
         self.lbl_round.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -508,34 +606,79 @@ class MainWindow(QMainWindow):
         self.lbl_next.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addWidget(self.lbl_stage)
+        layout.addWidget(self.progress)
         layout.addWidget(self.lbl_time)
         layout.addWidget(self.lbl_round)
         layout.addWidget(self.lbl_next)
 
         btn_layout = QHBoxLayout()
-        self.btn_start = QPushButton("Start/Pause")
+        self.btn_start = QPushButton("Start (Space)")
         self.btn_start.clicked.connect(self.toggle_timer)
-        self.btn_reset = QPushButton("Reset Session")
+        self.btn_reset = QPushButton("Reset Session (R)")
         self.btn_reset.clicked.connect(self.engine.reset)
-        self.btn_skip = QPushButton("Skip Stage")
+        self.btn_skip = QPushButton("Skip Stage (S)")
         self.btn_skip.clicked.connect(self.engine.skip)
-        
+
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_reset)
         btn_layout.addWidget(self.btn_skip)
         layout.addLayout(btn_layout)
 
-        self.btn_edit = QPushButton("Remake / Edit Timer")
+        self.btn_edit = QPushButton("Remake / Edit Timer (E)")
         self.btn_edit.clicked.connect(self.open_editor)
         layout.addWidget(self.btn_edit)
 
-    def setup_shortcuts(self):
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self).activated.connect(self.toggle_timer)
-        QShortcut(QKeySequence(Qt.Key.Key_R), self).activated.connect(self.engine.reset)
-        QShortcut(QKeySequence(Qt.Key.Key_S), self).activated.connect(self.engine.skip)
-        QShortcut(QKeySequence(Qt.Key.Key_E), self).activated.connect(self.open_editor)
-        QShortcut(QKeySequence(Qt.Key.Key_F), self).activated.connect(self.toggle_fullscreen)
-        QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(self.showNormal)
+    def setup_tray(self):
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+
+        tray_menu = QMenu()
+        restore_action = QAction("Show / Hide", self)
+        restore_action.triggered.connect(self.toggle_window)
+        quit_action = QAction("Quit Application", self)
+        quit_action.triggered.connect(QApplication.instance().quit)
+
+        tray_menu.addAction(restore_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.tray_activated)
+        self.tray_icon.show()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress:
+            fw = QApplication.focusWidget()
+            if isinstance(fw, (QLineEdit, QSpinBox, QComboBox)):
+                return super().eventFilter(obj, event)
+
+            key = event.key()
+            if key == Qt.Key.Key_Space:
+                if isinstance(fw, QPushButton):
+                    return super().eventFilter(obj, event)
+                self.toggle_timer()
+                return True
+            elif key == Qt.Key.Key_R:
+                self.engine.reset()
+                return True
+            elif key == Qt.Key.Key_S:
+                self.engine.skip()
+                return True
+            elif key == Qt.Key.Key_E:
+                self.open_editor()
+                return True
+            elif key == Qt.Key.Key_F:
+                self.toggle_fullscreen()
+                return True
+            elif key == Qt.Key.Key_M:
+                self.hide()
+                return True
+            elif key == Qt.Key.Key_Escape:
+                if self.isFullScreen():
+                    self.showNormal()
+                    return True
+        return super().eventFilter(obj, event)
 
     def toggle_timer(self):
         if self.engine.state == "RUNNING":
@@ -549,20 +692,46 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
 
+    def toggle_window(self):
+        if self.isHidden():
+            self.showNormal()
+            self.activateWindow()
+        else:
+            self.hide()
+
+    def tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_window()
+
     def open_editor(self):
         self.engine.pause()
         dlg = EditorDialog(self.config, self.audio, self)
         if dlg.exec():
             self.engine.load_preset()
 
-    def update_time_display(self, seconds):
-        self.lbl_time.setText(format_duration(seconds))
+    def update_time_display(self, remaining, total):
+        time_str = format_duration(remaining)
+        self.lbl_time.setText(time_str)
+        self.progress.setRange(0, total)
+        self.progress.setValue(total - remaining)
+
+        stage_name = "Timer"
+        if self.engine.stages and self.engine.stage_idx < len(self.engine.stages):
+            stage_name = self.engine.stages[self.engine.stage_idx]["name"]
+
+        tooltip = f"[{stage_name}] {time_str} left"
+        if self.engine.state == "PAUSED":
+            tooltip += " (Paused)"
+        elif self.engine.state == "WAITING":
+            tooltip += " (Waiting)"
+
+        self.tray_icon.setToolTip(tooltip)
 
     def update_stage_display(self, stage_idx, round_idx):
         if not self.engine.stages: return
         stage = self.engine.stages[stage_idx]
         self.lbl_stage.setText(stage["name"])
-        
+
         r_text = f"Round: {round_idx}"
         if not self.engine.infinite:
             r_text += f" / {self.engine.rounds}"
@@ -579,11 +748,23 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_next.setText(f"Next: {self.engine.stages[0]['name']}")
 
+    def update_state_display(self, state):
+        if state == "RUNNING":
+            self.btn_start.setText("Pause (Space)")
+        elif state == "PAUSED":
+            self.btn_start.setText("Resume (Space)")
+        elif state == "WAITING":
+            self.btn_start.setText("Start Next Stage (Space)")
+        else:
+            self.btn_start.setText("Start (Space)")
+
     def show_completion(self, elapsed):
         self.lbl_stage.setText("TIMER COMPLETE")
         self.lbl_time.setText("00:00")
+        self.progress.setValue(self.progress.maximum())
         self.lbl_round.setText(f"Total time: {format_duration(elapsed)}")
         self.lbl_next.setText("")
+        self.tray_icon.setToolTip("Timer Complete")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
