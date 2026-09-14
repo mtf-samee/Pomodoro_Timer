@@ -199,6 +199,14 @@ class TimerEngine(QObject):
         self.tick_signal.emit(self.remaining, self.current_stage_duration)
         self.stage_changed_signal.emit(self.stage_idx, self.round_idx)
 
+    def seek(self, new_remaining):
+        if self.state in ["STOPPED", "WAITING"]:
+            return
+        self.remaining = max(0, min(new_remaining, self.current_stage_duration))
+        if self.state == "RUNNING":
+            self.target_time = time.monotonic() + self.remaining
+        self.tick_signal.emit(self.remaining, self.current_stage_duration)
+
     def skip(self):
         if self.state == "STOPPED":
             return
@@ -395,6 +403,14 @@ class EditorDialog(QDialog):
         btn_layout.addWidget(btn_save)
         btn_layout.addWidget(btn_cancel)
         layout.addLayout(btn_layout)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.save_config()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+        else:
+            super().keyPressEvent(event)
 
     def browse_stage_sound(self):
         file, _ = QFileDialog.getOpenFileName(self, "Select Stage Sound", self.config.config["sound_dir"], "Audio Files (*.wav *.mp3 *.ogg *.flac)")
@@ -595,9 +611,13 @@ class MainWindow(QMainWindow):
         font_time.setBold(True)
         self.lbl_time.setFont(font_time)
 
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(10)
+        self.progress = QSlider(Qt.Orientation.Horizontal)
+        self.progress.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.progress.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.progress.sliderPressed.connect(self.on_slider_pressed)
+        self.progress.sliderReleased.connect(self.on_slider_released)
+        self.progress.sliderMoved.connect(self.on_slider_moved)
+        self.is_dragging = False
 
         self.lbl_round = QLabel("Round: 1 / 1")
         self.lbl_round.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -661,7 +681,7 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         restore_action = QAction("Show / Hide", self)
         restore_action.triggered.connect(self.toggle_window)
-        quit_action = QAction("Quit Application (Q)", self)
+        quit_action = QAction("Quit Application", self)
         quit_action.triggered.connect(QApplication.instance().quit)
 
         tray_menu.addAction(restore_action)
@@ -671,6 +691,20 @@ class MainWindow(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.tray_activated)
         self.tray_icon.show()
+
+    def on_slider_pressed(self):
+        self.is_dragging = True
+
+    def on_slider_moved(self, value):
+        total = self.engine.current_stage_duration
+        rem = total - value
+        self.lbl_time.setText(format_duration(rem))
+
+    def on_slider_released(self):
+        self.is_dragging = False
+        total = self.engine.current_stage_duration
+        new_remaining = total - self.progress.value()
+        self.engine.seek(new_remaining)
 
     def toggle_timer(self):
         if self.engine.state == "RUNNING":
@@ -707,9 +741,10 @@ class MainWindow(QMainWindow):
 
     def update_time_display(self, remaining, total):
         time_str = format_duration(remaining)
-        self.lbl_time.setText(time_str)
-        self.progress.setRange(0, total)
-        self.progress.setValue(total - remaining)
+        if not self.is_dragging:
+            self.lbl_time.setText(time_str)
+            self.progress.setRange(0, total)
+            self.progress.setValue(total - remaining)
 
         stage_name = "Timer"
         if self.engine.stages and self.engine.stage_idx < len(self.engine.stages):
@@ -757,7 +792,8 @@ class MainWindow(QMainWindow):
     def show_completion(self, elapsed):
         self.lbl_stage.setText("TIMER COMPLETE")
         self.lbl_time.setText("00:00")
-        self.progress.setValue(self.progress.maximum())
+        if not self.is_dragging:
+            self.progress.setValue(self.progress.maximum())
         self.lbl_round.setText(f"Total time: {format_duration(elapsed)}")
         self.lbl_next.setText("")
         self.tray_icon.setToolTip("Timer Complete")
@@ -773,7 +809,6 @@ if __name__ == "__main__":
         with open(pid_file, 'w') as f:
             f.write(str(os.getpid()))
     except IOError:
-        # App is already running, send SIGUSR1 to toggle window
         try:
             with open(pid_file, 'r') as f:
                 pid = int(f.read().strip())
@@ -787,12 +822,10 @@ if __name__ == "__main__":
     app.setDesktopFileName("pomodro-timer.desktop")
     window = MainWindow()
 
-    # Handle the incoming toggle signal
     def handle_toggle(signum, frame):
         QTimer.singleShot(0, window.toggle_window)
     signal.signal(signal.SIGUSR1, handle_toggle)
 
-    # Fast dummy timer to ensure python signals are processed instantly by the Qt Event Loop
     wakeup_timer = QTimer()
     wakeup_timer.timeout.connect(lambda: None)
     wakeup_timer.start(100)
