@@ -16,11 +16,11 @@ python3 pomodro_timer.py
 
 ## Features
 
+- **Interactive Timeline:** Drag the live progress bar to immediately seek/adjust the time remaining for the current stage.
+- **CLI / Shortcut Toggling:** Running the launch command again will seamlessly toggle the backgrounded system tray instance rather than opening duplicates.
 - **System Tray & Background Mode:** Minimize the timer to the system tray. The tray icon tooltip displays the live countdown and current stage.
-- **Visual Progress Bar:** Real-time progress tracking for the current stage.
-- **Auto/Manual Advance:** Choose whether the next stage starts automatically or waits for you to press Space (ideal for un-timed physical breaks).
+- **Auto/Manual Advance:** Choose whether the next stage starts automatically or waits for you to press Space.
 - **Advanced Audio Management:** Set global or per-stage audio files via file browsers. Adjust volume individually per stage.
-- **Dynamic Audio Test:** Preview stage sounds smoothly with a morphing Test/Stop button in the editor.
 - **Custom Stage Sequences:** Create unlimited stages with text-based duration parsing (e.g., `40m`, `1h 30m`, `90s`).
 - **Persistent JSON Configuration:** Presets, sounds, and settings are saved automatically to `~/.config/study_timer/config.json`.
 - **Native Notifications:** Wayland alerts via `libnotify` ensure you never miss a transition, even if the app is hidden.
@@ -35,4 +35,6 @@ python3 pomodro_timer.py
 | `E`      | Open Editor / Remake Timer |
 | `F`      | Toggle Fullscreen |
 | `M`      | Minimize to System Tray |
+| `Q`      | Quit the Application completely |
 | `Esc`    | Exit Fullscreen |
+| `Enter`  | Save & Apply (inside configuration editors) |
